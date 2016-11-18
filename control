@@ -1,0 +1,10 @@
+Package: com.uroboro.pasteboard
+Name: pasteboard
+Depends: 
+Version: 0.0.1
+Architecture: iphoneos-arm
+Description: An awesome tool of some sort!!
+Maintainer: uroboro <uroboro845@gmail.com>
+Author: uroboro <uroboro845@gmail.com>
+Section: System
+Tag: role::hacker
