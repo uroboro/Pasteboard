@@ -1,14 +1,28 @@
 #import <UIKit/UIPasteboard.h>
-#import <MobileCoreServices/UTType.h>
+#import <MobileCoreServices/MobileCoreServices.h>
 
-#include <dlfcn.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <sys/syslimits.h>
-#include <fcntl.h>
+//#include <unistd.h>
+//#include <sys/syslimits.h> // PATH_MAX
+//#include <fcntl.h> // fcntl
 
+#include <dispatch/dispatch.h>
 #include <objc/runtime.h>
 #include <objc/message.h>
+
+// UIKit fixes
+// kUIKitTypeColor doesn't actually exist but we make it to be consistent and use constants.
+NSString * const kUIKitTypeColor = @"com.apple.uikit.color";
+// kUIKitTypeImage is not linkable so we have to reproduce it.
+NSString * const kUIKitTypeImage = @"com.apple.uikit.image";
+
+// Apple decided to call the unsymbolicated function `_UIPasteboardInitialize` from within `UIApplicationMain` instead of calling it from `UIPasteboard`'s +load or +initialize. Therefore we have to make it ourselves for UIPasteboard to work (namely the fast accessors .string/s, .image/s, .url/s and .color/s).
+__attribute__((constructor))
+void _UIPasteboardInitialize() {
+	UIPasteboardTypeListString = [[NSArray alloc] initWithObjects:(id)kUTTypeUTF8PlainText, (id)kUTTypeText, nil];
+	UIPasteboardTypeListURL    = [[NSArray alloc] initWithObjects:(id)kUTTypeURL, nil];
+	UIPasteboardTypeListColor  = [[NSArray alloc] initWithObjects:kUIKitTypeColor, nil];
+	UIPasteboardTypeListImage  = [[NSArray alloc] initWithObjects:(id)kUTTypePNG, (id)kUTTypeTIFF, (id)kUTTypeJPEG, (id)kUTTypeGIF, kUIKitTypeImage, nil];
+}
 
 typedef NS_ENUM(NSUInteger, PBUIPasteboardMode) {
 	PBUIPasteboardModeNoop,
@@ -24,13 +38,17 @@ typedef NS_ENUM(NSUInteger, PBUIPasteboardType) {
 };
 
 const char * PBUIPasteboardTypeGetStringFromType(PBUIPasteboardType type) {
-	static const char *types[] = {
-		"public.text",
-		"public.url",
-		"public.png",
-		"com.apple.uikit.color"
-	};
-	return types[type];
+	static NSArray const * types = nil;
+	dispatch_once_t once;
+	dispatch_once(&once, ^{
+		types = @[
+				(id)kUTTypeText,
+				(id)kUTTypeURL,
+				(id)kUTTypePNG,
+				kUIKitTypeColor
+			];
+	});
+	return ((NSString *)types[type]).UTF8String;
 }
 
 static char * filePathFromFd(int fd) {
@@ -69,10 +87,10 @@ PBUIPasteboardType PBUIPasteboardTypeOfFd(int fd) {
 		[path release];
 
 		NSArray * typesArray = @[
-			UIPasteboardTypeListString?:@[@"public.utf8-plain-text",@"public.text"],
-			UIPasteboardTypeListURL?:@[@"public.url"],
-			UIPasteboardTypeListImage?:@[@"public.png",@"public.jpeg",@"com.compuserve.gif",@"com.apple.uikit.image"],
-			UIPasteboardTypeListColor?:@[@"com.apple.uikit.color"],
+			UIPasteboardTypeListString,
+			UIPasteboardTypeListURL,
+			UIPasteboardTypeListImage,
+			UIPasteboardTypeListColor,
 		];
 		__block NSUInteger index = 0;
 		[typesArray enumerateObjectsUsingBlock:^(NSArray * types, NSUInteger idx, BOOL * stop) {
@@ -86,13 +104,14 @@ PBUIPasteboardType PBUIPasteboardTypeOfFd(int fd) {
 	}
 }
 
-char * PBCreateBufferFromStdin(size_t * length) {
+char * PBCreateBufferFromFd(int fd, size_t * length) {
+	FILE * file = fdopen(fd, "r");
 	char c;
 	size_t p4kB = 4096, i = 0;
 	void * newPtr = NULL;
 	char * buffer = (char *)malloc(p4kB * sizeof(char));
 
-	while (buffer != NULL && (scanf("%c", &c) != EOF)) {
+	while (buffer != NULL && (fscanf(file, "%c", &c) != EOF)) {
 		if (i == p4kB * sizeof(char)) {
 			p4kB += 4096;
 			if ((newPtr = realloc(buffer, p4kB * sizeof(char))) != NULL) {
@@ -122,6 +141,58 @@ char * PBCreateBufferFromStdin(size_t * length) {
 	return buffer;
 }
 
+char * PBUIPasteboardSaveImage(UIImage * image, char * path, size_t * lengthPtr) {
+	if (!image) {
+		return NULL;
+	}
+
+	NSString * ext = @(path).pathExtension;
+	NSArray * supportedExtensions = @[
+		@"png",
+		@"jpg",
+	];
+
+	BOOL success = NO;
+	NSURL *fileURL = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:@"com.uikit.pasteboard.buffer"]];
+	NSError *error = nil;
+
+	switch ([supportedExtensions indexOfObject:ext]) {
+		case 0: {
+			NSData * data = UIImagePNGRepresentation(image);
+			if (![data writeToURL:fileURL options:NSDataWritingAtomic error:&error]) {
+				fprintf(stderr, "Error <%s>.\n", error.description.UTF8String);
+				break;
+			}
+			success = YES;
+		} break;
+
+		case 1: {
+			fprintf(stderr,
+				"JPG\n"
+			);
+		} break;
+		default: {
+			fprintf(stderr,
+				"Extension '%s' not supported.\n"
+				, ext.UTF8String
+			);
+		} break;
+	}
+
+	char * buffer = NULL;
+	if (success) {
+		size_t length = 0;
+		int fd = open(fileURL.path.UTF8String, O_RDONLY);
+		buffer = PBCreateBufferFromFd(fd, &length);
+		close(fd);
+		[NSFileManager.defaultManager removeItemAtURL:fileURL error:&error];
+		if (length > 0) {
+			*lengthPtr = length;
+		}
+	}
+	return buffer;
+}
+
 void PBUIPasteboardPerformCopy(int fd) {
 	PBUIPasteboardType inType = PBUIPasteboardTypeOfFd(fd);
 	const char * inTypeString = PBUIPasteboardTypeGetStringFromType(inType);
@@ -131,18 +202,20 @@ void PBUIPasteboardPerformCopy(int fd) {
 	switch (inType) {
 		case PBUIPasteboardTypeString: {
 			size_t length = 0;
-			char * string = PBCreateBufferFromStdin(&length);
+			char * string = PBCreateBufferFromFd(fd, &length);
 			if (length < 1) {
 				break;
 			}
 			NSString * dataString = [NSString stringWithUTF8String:string];
 			free(string);
-#if 01
-			NSData * data = [dataString dataUsingEncoding:NSUTF8StringEncoding];
-			[generalPb setData:data forPasteboardType:@(inTypeString)];
-#else
 			generalPb.string = dataString;
-#endif
+		} break;
+
+		case PBUIPasteboardTypeImage: {
+			char * path = filePathFromFd(fd);
+			UIImage * image = [UIImage imageWithContentsOfFile:@(path)];
+			generalPb.image = image;
+			free(path);
 		} break;
 
 		default: {
@@ -156,17 +229,22 @@ void PBUIPasteboardPerformPaste(int fd) {
 	const char * outTypeString = PBUIPasteboardTypeGetStringFromType(outType);
 
 	UIPasteboard * generalPb = UIPasteboard.generalPasteboard;
-	NSData * outValue = [generalPb dataForPasteboardType:@(outTypeString)];
 
 	switch (outType) {
 		case PBUIPasteboardTypeString: {
-#if 01
-			NSString * dataString = [[NSString alloc] initWithData:outValue encoding:NSUTF8StringEncoding];
-			fprintf(stdout, "%s", dataString.UTF8String);
-			[dataString release];
-#else
-			fprintf(fd, "%s", generalPb.string.UTF8String);
-#endif
+			dprintf(fd, "%s", generalPb.string.UTF8String);
+		} break;
+
+		case PBUIPasteboardTypeImage: {
+			char * path = filePathFromFd(fd);
+			size_t length = 0;
+			char * raw = PBUIPasteboardSaveImage(generalPb.image, path, &length);
+			if (!raw) {
+				fprintf(stderr, "No buffer.\n");
+				break;
+			}
+			write(fd, raw, length);
+			free(path);
 		} break;
 
 		default: {
