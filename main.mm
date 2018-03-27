@@ -1,13 +1,23 @@
+#include <dispatch/dispatch.h>
+#include <objc/runtime.h>
+#include <objc/message.h>
+
+#include <getopt.h> // getopt_long()
+#include <libgen.h> // basename()
+
 #import <UIKit/UIPasteboard.h>
 #import <MobileCoreServices/MobileCoreServices.h>
 
 //#include <unistd.h>
 //#include <sys/syslimits.h> // PATH_MAX
-//#include <fcntl.h> // fcntl
+//#include <fcntl.h> // fcntl()
 
-#include <dispatch/dispatch.h>
-#include <objc/runtime.h>
-#include <objc/message.h>
+#define _LOGX {fprintf(stderr, "XXX passing line %d %s\n", __LINE__, __PRETTY_FUNCTION__);}
+#if 01
+#define LOGX _LOGX
+#else
+#define LOGX
+#endif
 
 // UIKit fixes
 // kUIKitTypeColor doesn't actually exist but we make it to be consistent and use constants.
@@ -18,30 +28,34 @@ NSString * const kUIKitTypeImage = @"com.apple.uikit.image";
 // Apple decided to call the unsymbolicated function `_UIPasteboardInitialize` from within `UIApplicationMain` instead of calling it from `UIPasteboard`'s +load or +initialize. Therefore we have to make it ourselves for UIPasteboard to work (namely the fast accessors .string/s, .image/s, .url/s and .color/s).
 __attribute__((constructor))
 void _UIPasteboardInitialize() {
-	UIPasteboardTypeListString = [[NSArray alloc] initWithObjects:(id)kUTTypeUTF8PlainText, (id)kUTTypeText, nil];
-	UIPasteboardTypeListURL    = [[NSArray alloc] initWithObjects:(id)kUTTypeURL, nil];
-	UIPasteboardTypeListColor  = [[NSArray alloc] initWithObjects:kUIKitTypeColor, nil];
-	UIPasteboardTypeListImage  = [[NSArray alloc] initWithObjects:(id)kUTTypePNG, (id)kUTTypeTIFF, (id)kUTTypeJPEG, (id)kUTTypeGIF, kUIKitTypeImage, nil];
+	UIPasteboardTypeListString = @[(id)kUTTypeUTF8PlainText, (id)kUTTypeText];
+	UIPasteboardTypeListURL    = @[(id)kUTTypeURL];
+	UIPasteboardTypeListColor  = @[kUIKitTypeColor];
+	UIPasteboardTypeListImage  = @[(id)kUTTypePNG, (id)kUTTypeTIFF, (id)kUTTypeJPEG, (id)kUTTypeGIF, kUIKitTypeImage];
 }
 
-typedef NS_ENUM(NSUInteger, PBUIPasteboardMode) {
-	PBUIPasteboardModeNoop,
-	PBUIPasteboardModeCopy,
-	PBUIPasteboardModePaste,
+NSString * const kPBPrivateTypeDefault = @"private.default";
+
+typedef NS_ENUM(NSUInteger, PBPasteboardMode) {
+	PBPasteboardModeNoop,
+	PBPasteboardModeCopy,
+	PBPasteboardModePaste,
 };
 
-typedef NS_ENUM(NSUInteger, PBUIPasteboardType) {
-	PBUIPasteboardTypeString,
-	PBUIPasteboardTypeURL,
-	PBUIPasteboardTypeImage,
-	PBUIPasteboardTypeColor,
+typedef NS_ENUM(NSUInteger, PBPasteboardType) {
+	PBPasteboardTypeDefault,
+	PBPasteboardTypeString,
+	PBPasteboardTypeURL,
+	PBPasteboardTypeImage,
+	PBPasteboardTypeColor,
 };
 
-const char * PBUIPasteboardTypeGetStringFromType(PBUIPasteboardType type) {
+const char * PBPasteboardTypeGetStringFromType(PBPasteboardType type) {
 	static NSArray const * types = nil;
-	dispatch_once_t once;
+	dispatch_once_t once = 0;
 	dispatch_once(&once, ^{
 		types = @[
+				kPBPrivateTypeDefault,
 				(id)kUTTypeText,
 				(id)kUTTypeURL,
 				(id)kUTTypePNG,
@@ -80,13 +94,16 @@ NSString * PBCreateUTIStringFromFilePath(NSString * filePath) {
 		NULL);
 }
 
-PBUIPasteboardType PBUIPasteboardTypeOfFd(int fd) {
+PBPasteboardType PBPasteboardTypeOfFd(int fd) {
 	@autoreleasepool {
 		NSString * path = PBCreateFilePathFromFd(fd);
+		//fprintf(stderr, "Path %s\n", path.UTF8String);
 		NSString * UTI = PBCreateUTIStringFromFilePath(path);
+		//fprintf(stderr, "UTI %s\n", UTI.UTF8String);
 		[path release];
 
 		NSArray * typesArray = @[
+			@[kPBPrivateTypeDefault],
 			UIPasteboardTypeListString,
 			UIPasteboardTypeListURL,
 			UIPasteboardTypeListImage,
@@ -100,7 +117,7 @@ PBUIPasteboardType PBUIPasteboardTypeOfFd(int fd) {
 			}
 		}];
 		[UTI release];
-		return (PBUIPasteboardType)index;
+		return (PBPasteboardType)index;
 	}
 }
 
@@ -127,9 +144,9 @@ char * PBCreateBufferFromFd(int fd, size_t * length) {
 	}
 
 	if (buffer != NULL) {
-		buffer[i] = '\0';
 		if ((newPtr = realloc(buffer, (i + 1) * sizeof(char))) != NULL) {
 			buffer = (char *)newPtr;
+			buffer[i] = '\0';
 		} else {
 			free(buffer);
 			i = 0;
@@ -137,11 +154,13 @@ char * PBCreateBufferFromFd(int fd, size_t * length) {
 		}
 	}
 
-	*length = i;
+	if (length) {
+		*length = i;
+	}
 	return buffer;
 }
 
-char * PBUIPasteboardSaveImage(UIImage * image, char * path, size_t * lengthPtr) {
+char * PBPasteboardSaveImage(UIImage * image, char * path, size_t * lengthPtr) {
 	if (!image) {
 		return NULL;
 	}
@@ -153,23 +172,17 @@ char * PBUIPasteboardSaveImage(UIImage * image, char * path, size_t * lengthPtr)
 	];
 
 	BOOL success = NO;
-	NSURL *fileURL = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:@"com.uikit.pasteboard.buffer"]];
-	NSError *error = nil;
+	NSURL * fileURL = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:@"com.uikit.pasteboard.buffer"]];
+	NSError * error = nil;
+	NSData * data = nil;
 
 	switch ([supportedExtensions indexOfObject:ext]) {
 		case 0: {
-			NSData * data = UIImagePNGRepresentation(image);
-			if (![data writeToURL:fileURL options:NSDataWritingAtomic error:&error]) {
-				fprintf(stderr, "Error <%s>.\n", error.description.UTF8String);
-				break;
-			}
-			success = YES;
+			data = UIImagePNGRepresentation(image);
 		} break;
 
 		case 1: {
-			fprintf(stderr,
-				"JPG\n"
-			);
+			data = UIImageJPEGRepresentation(image, 1.0);
 		} break;
 		default: {
 			fprintf(stderr,
@@ -179,10 +192,18 @@ char * PBUIPasteboardSaveImage(UIImage * image, char * path, size_t * lengthPtr)
 		} break;
 	}
 
+	if (data) {
+		if (![data writeToURL:fileURL options:NSDataWritingAtomic error:&error]) {
+			fprintf(stderr, "Error <%s>.\n", error.description.UTF8String);
+			return NULL;
+		}
+		success = YES;
+	}
+
 	char * buffer = NULL;
 	if (success) {
-		size_t length = 0;
 		int fd = open(fileURL.path.UTF8String, O_RDONLY);
+		size_t length = 0;
 		buffer = PBCreateBufferFromFd(fd, &length);
 		close(fd);
 		[NSFileManager.defaultManager removeItemAtURL:fileURL error:&error];
@@ -193,14 +214,23 @@ char * PBUIPasteboardSaveImage(UIImage * image, char * path, size_t * lengthPtr)
 	return buffer;
 }
 
-void PBUIPasteboardPerformCopy(int fd) {
-	PBUIPasteboardType inType = PBUIPasteboardTypeOfFd(fd);
-	const char * inTypeString = PBUIPasteboardTypeGetStringFromType(inType);
+void PBPasteboardPerformCopy(int fd, PBPasteboardType overrideType) {
+	PBPasteboardType inType = (overrideType != PBPasteboardTypeDefault) ? overrideType : PBPasteboardTypeOfFd(fd);
 
 	UIPasteboard * generalPb = UIPasteboard.generalPasteboard;
 
+	//const char * inTypeString = PBPasteboardTypeGetStringFromType(inType);
+	//fprintf(stderr, "copy: Resource type <%s>.\n", inTypeString);
+
 	switch (inType) {
-		case PBUIPasteboardTypeString: {
+		default: {
+			NSString * path = PBCreateFilePathFromFd(fd);
+			NSString * actualUTI = PBCreateUTIStringFromFilePath(path);
+			[path release];
+			//fprintf(stderr, "copy: Resource type <%s> unsupported. Performing default action.\n", actualUTI.UTF8String);
+			[actualUTI release];
+		}
+		case PBPasteboardTypeString: {
 			size_t length = 0;
 			char * string = PBCreateBufferFromFd(fd, &length);
 			if (length < 1) {
@@ -211,34 +241,43 @@ void PBUIPasteboardPerformCopy(int fd) {
 			generalPb.string = dataString;
 		} break;
 
-		case PBUIPasteboardTypeImage: {
+		case PBPasteboardTypeImage: {
 			char * path = filePathFromFd(fd);
 			UIImage * image = [UIImage imageWithContentsOfFile:@(path)];
 			generalPb.image = image;
 			free(path);
 		} break;
-
-		default: {
-			fprintf(stderr, "Resource type <%s> unsupported.\n", inTypeString);
-		} break;
 	}
 }
 
-void PBUIPasteboardPerformPaste(int fd) {
-	PBUIPasteboardType outType = PBUIPasteboardTypeOfFd(fd);
-	const char * outTypeString = PBUIPasteboardTypeGetStringFromType(outType);
+void PBPasteboardPerformPaste(int fd, PBPasteboardType overrideType) {
+	PBPasteboardType outType = (overrideType != PBPasteboardTypeDefault) ? overrideType : PBPasteboardTypeOfFd(fd);
 
 	UIPasteboard * generalPb = UIPasteboard.generalPasteboard;
 
+	//const char * outTypeString = PBPasteboardTypeGetStringFromType(outType);
+	//fprintf(stderr, "paste: Resource type <%s>.\n", outTypeString);
+
 	switch (outType) {
-		case PBUIPasteboardTypeString: {
-			dprintf(fd, "%s", generalPb.string.UTF8String);
+		default: {
+			NSString * path = PBCreateFilePathFromFd(fd);
+			NSString * actualUTI = PBCreateUTIStringFromFilePath(path);
+			[path release];
+			//fprintf(stderr, "paste: Resource type <%s> unsupported. Performing default action.\n", actualUTI.UTF8String);
+			[actualUTI release];
+		}
+		case PBPasteboardTypeString: {
+			if (generalPb.string) {
+				dprintf(fd, "%s", generalPb.string.UTF8String);
+			} else {
+				dprintf(fd, "\n");
+			}
 		} break;
 
-		case PBUIPasteboardTypeImage: {
+		case PBPasteboardTypeImage: {
 			char * path = filePathFromFd(fd);
 			size_t length = 0;
-			char * raw = PBUIPasteboardSaveImage(generalPb.image, path, &length);
+			char * raw = PBPasteboardSaveImage(generalPb.image, path, &length);
 			if (!raw) {
 				fprintf(stderr, "No buffer.\n");
 				break;
@@ -246,29 +285,107 @@ void PBUIPasteboardPerformPaste(int fd) {
 			write(fd, raw, length);
 			free(path);
 		} break;
-
-		default: {
-			fprintf(stderr, "Resource type <%s> unsupported.\n", outTypeString);
-		} break;
 	}
+
+}
+
+void PBPasteboardPrintHelp(int argc, char **argv, char **envp) {
+	fprintf(stderr,
+		"Usage: %s [OPTION]\n"
+		"\n"
+		"Overview: copy and paste items to the global pasteboard. Supports piping in and out as well as to files. It will try to automatically determine the file type based on the file extension and use the according pasteboard value.\n"
+		"Currently supported extensions:\n"
+		"  txt -> string\n"
+		"  jpg, png -> image\n"
+		"\n"
+		"Options:\n"
+		"  -h,--help      Print this help.\n"
+		"  -s,--string    Force output to be the string value if available.\n"
+		"  -u,--url       Same for URL value.\n"
+		"  -i,--image     Same for image value.\n"
+		"  -c,--color     Same for color value.\n"
+		, basename(argv[0])
+	);
 }
 
 int main(int argc, char **argv, char **envp) {
 	@autoreleasepool {
+		int help_flag = 0;
+		PBPasteboardType overrideType = PBPasteboardTypeDefault;
+
+		// Process options
+		struct option long_options[] = {
+			{ "help",   no_argument, NULL, 'h' },
+			{ "string", no_argument, NULL, 's' },
+			{ "url",    no_argument, NULL, 'u' },
+			{ "image",  no_argument, NULL, 'i' },
+			{ "color",  no_argument, NULL, 'c' },
+			/* End of options. */
+			{ 0, 0, 0, 0 }
+		};
+
+		int opt;
+		int option_index = 0;
+		while ((opt = getopt_long(argc, argv, "hsuic", long_options, &option_index)) != -1) {
+			switch (opt) {
+			case 's':
+				if (overrideType == PBPasteboardTypeDefault) {
+					overrideType = PBPasteboardTypeString;
+				} else {
+					fprintf(stderr, "Cannot set multiple pasteboard types.\n");
+				}
+				break;
+
+			case 'u':
+				if (overrideType == PBPasteboardTypeDefault) {
+					overrideType = PBPasteboardTypeURL;
+				} else {
+					fprintf(stderr, "Cannot set multiple pasteboard types.\n");
+				}
+				break;
+
+			case 'i':
+				if (overrideType == PBPasteboardTypeDefault) {
+					overrideType = PBPasteboardTypeImage;
+				} else {
+					fprintf(stderr, "Cannot set multiple pasteboard types.\n");
+				}
+				break;
+
+			case 'c':
+				if (overrideType == PBPasteboardTypeDefault) {
+					overrideType = PBPasteboardTypeColor;
+				} else {
+					fprintf(stderr, "Cannot set multiple pasteboard types.\n");
+				}
+				break;
+
+			default:
+			case 'h':
+				help_flag = 1;
+				break;
+			}
+		}
+
+		if (help_flag) {
+			PBPasteboardPrintHelp(argc, argv, envp);
+			return 0;
+		}
+
 		int inFD = STDIN_FILENO;
 		int outFD = STDOUT_FILENO;
 
-		PBUIPasteboardMode mode =
-			isatty(inFD) ? PBUIPasteboardModePaste :
-			isatty(outFD) ? PBUIPasteboardModeCopy :
-			PBUIPasteboardModeCopy | PBUIPasteboardModePaste;
+		PBPasteboardMode mode =
+			isatty(inFD) ? PBPasteboardModePaste :
+			isatty(outFD) ? PBPasteboardModeCopy :
+			PBPasteboardModeCopy | PBPasteboardModePaste;
 
-		if (mode & PBUIPasteboardModeCopy) {
-			PBUIPasteboardPerformCopy(inFD);
+		if (mode & PBPasteboardModeCopy) {
+			PBPasteboardPerformCopy(inFD, overrideType);
 		}
 
-		if (mode & PBUIPasteboardModePaste) {
-			PBUIPasteboardPerformPaste(outFD);
+		if (mode & PBPasteboardModePaste) {
+			PBPasteboardPerformPaste(outFD, overrideType);
 		}
 	}
 	return 0;
