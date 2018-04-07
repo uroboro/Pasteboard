@@ -1,6 +1,6 @@
-#include <dispatch/dispatch.h>
 #include <objc/runtime.h>
 #include <objc/message.h>
+#include <pthread.h>
 
 #include <getopt.h> // getopt_long()
 #include <libgen.h> // basename()
@@ -28,10 +28,10 @@ NSString * const kUIKitTypeImage = @"com.apple.uikit.image";
 // Apple decided to call the unsymbolicated function `_UIPasteboardInitialize` from within `UIApplicationMain` instead of calling it from `UIPasteboard`'s +load or +initialize. Therefore we have to make it ourselves for UIPasteboard to work (namely the fast accessors .string/s, .image/s, .url/s and .color/s).
 __attribute__((constructor))
 void _UIPasteboardInitialize() {
-	UIPasteboardTypeListString = @[(id)kUTTypeUTF8PlainText, (id)kUTTypeText];
-	UIPasteboardTypeListURL    = @[(id)kUTTypeURL];
-	UIPasteboardTypeListColor  = @[kUIKitTypeColor];
-	UIPasteboardTypeListImage  = @[(id)kUTTypePNG, (id)kUTTypeTIFF, (id)kUTTypeJPEG, (id)kUTTypeGIF, kUIKitTypeImage];
+	UIPasteboardTypeListString = [NSArray arrayWithObjects: (id)kUTTypeUTF8PlainText, (id)kUTTypeText, nil];
+	UIPasteboardTypeListURL    = [NSArray arrayWithObjects: (id)kUTTypeURL, nil];
+	UIPasteboardTypeListImage  = [NSArray arrayWithObjects: (id)kUTTypePNG, (id)kUTTypeTIFF, (id)kUTTypeJPEG, (id)kUTTypeGIF, kUIKitTypeImage, nil];
+	UIPasteboardTypeListColor  = [NSArray arrayWithObjects: kUIKitTypeColor, nil];
 }
 
 NSString * const kPBPrivateTypeDefault = @"private.default";
@@ -50,18 +50,21 @@ typedef NS_ENUM(NSUInteger, PBPasteboardType) {
 	PBPasteboardTypeColor,
 };
 
+static NSArray const * types = nil;
+static void PBPasteboardOnce(void) {
+	types = [NSArray arrayWithObjects:
+			kPBPrivateTypeDefault,
+			(id)kUTTypeText,
+			(id)kUTTypeURL,
+			(id)kUTTypePNG,
+			kUIKitTypeColor,
+			nil
+		];
+}
+
 const char * PBPasteboardTypeGetStringFromType(PBPasteboardType type) {
-	static NSArray const * types = nil;
-	dispatch_once_t once = 0;
-	dispatch_once(&once, ^{
-		types = @[
-				kPBPrivateTypeDefault,
-				(id)kUTTypeText,
-				(id)kUTTypeURL,
-				(id)kUTTypePNG,
-				kUIKitTypeColor
-			];
-	});
+	pthread_once_t once = PTHREAD_ONCE_INIT;
+	pthread_once(&once, &PBPasteboardOnce);
 	return ((NSString *)types[type]).UTF8String;
 }
 
@@ -102,20 +105,21 @@ PBPasteboardType PBPasteboardTypeOfFd(int fd) {
 		//fprintf(stderr, "UTI %s\n", UTI.UTF8String);
 		[path release];
 
-		NSArray * typesArray = @[
-			@[kPBPrivateTypeDefault],
+		NSArray * typesArray = [NSArray arrayWithObjects:
+			[NSArray arrayWithObjects: kPBPrivateTypeDefault, nil],
 			UIPasteboardTypeListString,
 			UIPasteboardTypeListURL,
 			UIPasteboardTypeListImage,
 			UIPasteboardTypeListColor,
+			nil
 		];
-		__block NSUInteger index = 0;
-		[typesArray enumerateObjectsUsingBlock:^(NSArray * types, NSUInteger idx, BOOL * stop) {
+		NSUInteger index = 0;
+		for (NSArray * types in typesArray) {
 			if ([types containsObject:UTI]) {
-				index = idx;
-				*stop = YES;
+				index = [typesArray indexOfObject:types];
+				break;
 			}
-		}];
+		}
 		[UTI release];
 		return (PBPasteboardType)index;
 	}
@@ -166,9 +170,10 @@ char * PBPasteboardSaveImage(UIImage * image, char * path, size_t * lengthPtr) {
 	}
 
 	NSString * ext = @(path).pathExtension;
-	NSArray * supportedExtensions = @[
+	NSArray * supportedExtensions = [NSArray arrayWithObjects:
 		@"png",
 		@"jpg",
+		nil
 	];
 
 	BOOL success = NO;
@@ -300,10 +305,10 @@ void PBPasteboardPrintHelp(int argc, char **argv, char **envp) {
 		"\n"
 		"Options:\n"
 		"  -h,--help      Print this help.\n"
-		"  -s,--string    Force output to be the string value if available.\n"
-		"  -u,--url       Same for URL value.\n"
-		"  -i,--image     Same for image value.\n"
-		"  -c,--color     Same for color value.\n"
+		"  -s,--string    Force type to be the string value if available.\n"
+		"  -u,--url       Force type to be the URL value if available.\n"
+		"  -i,--image     Force type to be the image value if available.\n"
+		"  -c,--color     Force type to be the color value if available.\n"
 		, basename(argv[0])
 	);
 }
